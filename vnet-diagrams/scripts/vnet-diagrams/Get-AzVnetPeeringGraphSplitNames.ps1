@@ -12,7 +12,11 @@ param(
     [string]$OutputPath = ".",
 
     [Parameter(Mandatory = $false)]
-    [string]$GraphName = "azure-vnet-peerings"
+    [string]$GraphName = "azure-vnet-peerings",
+
+    # When set, the cross-subscription summary includes only subscription pairs with >1 peerings.
+    [Parameter(Mandatory = $false)]
+    [switch]$ComplexCrossConnectionsOnly
 )
 
 Set-StrictMode -Version Latest
@@ -359,20 +363,6 @@ foreach ($subscriptionId in $requestedSubscriptionIds) {
     })
 }
 
-$summaryNodeRecords = @(
-    $allNodes.Values |
-        Group-Object -Property SubscriptionId |
-        Sort-Object -Property Name |
-        ForEach-Object {
-            $subId = $_.Name
-            $subLabel = if ($subscriptionNames.ContainsKey($subId.ToLowerInvariant())) { $subscriptionNames[$subId.ToLowerInvariant()] } else { $subId }
-            [pscustomobject]@{
-                Key          = $subId
-                DisplayLabel = $subLabel
-            }
-        }
-)
-
 $summaryEdgeMap = @{}
 foreach ($edge in $allEdges | Where-Object { $_.FromSubscriptionId -ne $_.ToSubscriptionId }) {
     $pair = @($edge.FromSubscriptionId, $edge.ToSubscriptionId) | Sort-Object
@@ -392,6 +382,30 @@ foreach ($edge in $allEdges | Where-Object { $_.FromSubscriptionId -ne $_.ToSubs
 }
 
 $summaryEdgeRecords = @($summaryEdgeMap.Values)
+if ($ComplexCrossConnectionsOnly) {
+    $summaryEdgeRecords = @($summaryEdgeRecords | Where-Object { $_.Count -gt 1 })
+}
+
+$summaryNodeIdsInUse = @{}
+foreach ($edge in $summaryEdgeRecords) {
+    $summaryNodeIdsInUse[$edge.FromKey] = $true
+    $summaryNodeIdsInUse[$edge.ToKey] = $true
+}
+
+$summaryNodeRecords = @(
+    $allNodes.Values |
+        Group-Object -Property SubscriptionId |
+        Sort-Object -Property Name |
+        Where-Object { $summaryNodeIdsInUse.ContainsKey($_.Name) } |
+        ForEach-Object {
+            $subId = $_.Name
+            $subLabel = if ($subscriptionNames.ContainsKey($subId.ToLowerInvariant())) { $subscriptionNames[$subId.ToLowerInvariant()] } else { $subId }
+            [pscustomobject]@{
+                Key          = $subId
+                DisplayLabel = $subLabel
+            }
+        }
+)
 $summaryDiagramModel = Convert-ToDiagramModel -NodeRecords $summaryNodeRecords -EdgeRecords $summaryEdgeRecords
 $summaryBaseFileName = $GraphName + "-cross-subscriptions"
 $summaryGraphTitle = $GraphName + " cross subscriptions"
