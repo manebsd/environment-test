@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
-    [string[]]$SubscriptionIds,
+    # Accepts subscription objects from Get-AzSubscription, or plain subscription ID strings.
+    [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
+    [object[]]$Subscriptions,
 
     [Parameter(Mandatory = $false)]
     [ValidateSet("mermaid", "graphviz", "both")]
@@ -238,11 +239,43 @@ $null = Connect-AzAccount -ErrorAction Stop
 
 $allNodes = @{}
 $allEdges = [System.Collections.Generic.List[object]]::new()
-$requestedSubscriptionIds = $SubscriptionIds | Sort-Object -Unique
+
+# Normalise input: accept subscription objects (Get-AzSubscription) or plain ID strings.
+# Pre-populate subscriptionNames from objects so Set-AzContext is not needed just for names.
+$subscriptionNames = @{}
+$requestedSubscriptionIds = [System.Collections.Generic.List[string]]::new()
+
+foreach ($sub in $Subscriptions) {
+    if ($sub -is [string]) {
+        $id = $sub.Trim()
+        if (-not $requestedSubscriptionIds.Contains($id)) {
+            $requestedSubscriptionIds.Add($id)
+        }
+        # Name will be captured from Set-AzContext during the scan loop
+    } else {
+        $id = if ($sub.PSObject.Properties['Id']) { $sub.Id } `
+              elseif ($sub.PSObject.Properties['SubscriptionId']) { $sub.SubscriptionId } `
+              else { $null }
+        $name = if ($sub.PSObject.Properties['Name']) { $sub.Name } else { $id }
+        if ($null -ne $id) {
+            $id = $id.Trim()
+            if (-not $requestedSubscriptionIds.Contains($id)) {
+                $requestedSubscriptionIds.Add($id)
+            }
+            $subscriptionNames[$id.ToLowerInvariant()] = $name
+        }
+    }
+}
+
+$requestedSubscriptionIds = @($requestedSubscriptionIds | Sort-Object -Unique)
 
 foreach ($subscriptionId in $requestedSubscriptionIds) {
-    Write-Host "Scanning subscription: $subscriptionId"
-    $null = Set-AzContext -SubscriptionId $subscriptionId -ErrorAction Stop
+    $context = Set-AzContext -SubscriptionId $subscriptionId -ErrorAction Stop
+    # Only fill name from context if not already provided by a subscription object
+    if (-not $subscriptionNames.ContainsKey($subscriptionId.ToLowerInvariant())) {
+        $subscriptionNames[$subscriptionId.ToLowerInvariant()] = $context.Subscription.Name
+    }
+    Write-Host "Scanning subscription: $($subscriptionNames[$subscriptionId.ToLowerInvariant()]) ($subscriptionId)"
 
     $vnets = Get-AzVirtualNetwork -ErrorAction Stop
     foreach ($vnet in $vnets) {
@@ -253,13 +286,15 @@ foreach ($subscriptionId in $requestedSubscriptionIds) {
 
         $nodeKey = $vnet.Id.ToLowerInvariant()
         if (-not $allNodes.ContainsKey($nodeKey)) {
+            $subName = if ($subscriptionNames.ContainsKey($vnetParts.SubscriptionId.ToLowerInvariant())) { $subscriptionNames[$vnetParts.SubscriptionId.ToLowerInvariant()] } else { $vnetParts.SubscriptionId }
             $allNodes[$nodeKey] = [pscustomobject]@{
                 Key            = $nodeKey
                 ResourceId     = $vnet.Id
                 SubscriptionId = $vnetParts.SubscriptionId
+                SubscriptionName = $subName
                 ResourceGroup  = $vnetParts.ResourceGroup
                 VnetName       = $vnetParts.VnetName
-                DisplayLabel   = "$($vnetParts.ResourceGroup)/$($vnetParts.VnetName)"
+                DisplayLabel   = "$subName`n$($vnetParts.ResourceGroup)/$($vnetParts.VnetName)"
             }
         }
 
@@ -275,13 +310,15 @@ foreach ($subscriptionId in $requestedSubscriptionIds) {
 
             $remoteKey = $peering.RemoteVirtualNetwork.Id.ToLowerInvariant()
             if (-not $allNodes.ContainsKey($remoteKey)) {
+                $remoteSubName = if ($subscriptionNames.ContainsKey($remoteParts.SubscriptionId.ToLowerInvariant())) { $subscriptionNames[$remoteParts.SubscriptionId.ToLowerInvariant()] } else { $remoteParts.SubscriptionId }
                 $allNodes[$remoteKey] = [pscustomobject]@{
                     Key            = $remoteKey
                     ResourceId     = $peering.RemoteVirtualNetwork.Id
                     SubscriptionId = $remoteParts.SubscriptionId
+                    SubscriptionName = $remoteSubName
                     ResourceGroup  = $remoteParts.ResourceGroup
                     VnetName       = $remoteParts.VnetName
-                    DisplayLabel   = "$($remoteParts.ResourceGroup)/$($remoteParts.VnetName)"
+                    DisplayLabel   = "$remoteSubName`n$($remoteParts.ResourceGroup)/$($remoteParts.VnetName)"
                 }
             }
 
@@ -306,17 +343,19 @@ foreach ($subscriptionId in $requestedSubscriptionIds) {
     $subscriptionNodes = @($allNodes.Values | Where-Object { $_.SubscriptionId -eq $subscriptionId })
     $subscriptionEdges = @($allEdges | Where-Object { $_.FromSubscriptionId -eq $subscriptionId -and $_.ToSubscriptionId -eq $subscriptionId })
 
+    $subDisplayName = if ($subscriptionNames.ContainsKey($subscriptionId.ToLowerInvariant())) { $subscriptionNames[$subscriptionId.ToLowerInvariant()] } else { $subscriptionId }
     $diagramModel = Convert-ToDiagramModel -NodeRecords $subscriptionNodes -EdgeRecords $subscriptionEdges
-    $baseFileName = $GraphName + "-subscription-" + $subscriptionId
-    $graphTitle = $GraphName + " subscription " + $subscriptionId
+    $baseFileName = $GraphName + "-subscription-" + (Get-SafeFileName -Text $subDisplayName)
+    $graphTitle = $GraphName + " - " + $subDisplayName
     $writtenFiles = Write-DiagramFiles -Nodes $diagramModel.Nodes -Edges $diagramModel.Edges -Format $Format -OutputDirectory $outputDirectory -BaseFileName $baseFileName -GraphTitle $graphTitle
 
     $manifestRows.Add([pscustomobject]@{
-        DiagramType    = "subscription"
-        Scope          = $subscriptionId
-        NodeCount      = $diagramModel.Nodes.Count
-        EdgeCount      = $diagramModel.Edges.Count
-        OutputFiles    = ($writtenFiles -join ';')
+        DiagramType      = "subscription"
+        SubscriptionId   = $subscriptionId
+        SubscriptionName = $subDisplayName
+        NodeCount        = $diagramModel.Nodes.Count
+        EdgeCount        = $diagramModel.Edges.Count
+        OutputFiles      = ($writtenFiles -join ';')
     })
 }
 
@@ -325,9 +364,11 @@ $summaryNodeRecords = @(
         Group-Object -Property SubscriptionId |
         Sort-Object -Property Name |
         ForEach-Object {
+            $subId = $_.Name
+            $subLabel = if ($subscriptionNames.ContainsKey($subId.ToLowerInvariant())) { $subscriptionNames[$subId.ToLowerInvariant()] } else { $subId }
             [pscustomobject]@{
-                Key          = $_.Name
-                DisplayLabel = $_.Name
+                Key          = $subId
+                DisplayLabel = $subLabel
             }
         }
 )
