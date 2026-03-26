@@ -14,9 +14,18 @@ param(
     [Parameter(Mandatory = $false)]
     [string]$GraphName = "azure-vnet-peerings",
 
-    # When set, the cross-subscription summary includes only subscription pairs with >1 peerings.
+    # When set, the cross-subscription summary includes only complex relationships.
     [Parameter(Mandatory = $false)]
-    [switch]$ComplexCrossConnectionsOnly
+    [switch]$ComplexCrossConnectionsOnly,
+
+    # Optional hub subscription ID or name for hub-aware complexity filtering.
+    # With -ComplexCrossConnectionsOnly and this value set, hub-only spokes are excluded.
+    [Parameter(Mandatory = $false)]
+    [string]$HubSubscription,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 1000000)]
+    [int]$MinCrossPeeringsForComplex = 2
 )
 
 Set-StrictMode -Version Latest
@@ -383,7 +392,71 @@ foreach ($edge in $allEdges | Where-Object { $_.FromSubscriptionId -ne $_.ToSubs
 
 $summaryEdgeRecords = @($summaryEdgeMap.Values)
 if ($ComplexCrossConnectionsOnly) {
-    $summaryEdgeRecords = @($summaryEdgeRecords | Where-Object { $_.Count -gt 1 })
+    if (-not [string]::IsNullOrWhiteSpace($HubSubscription)) {
+        # Resolve hub by ID (preferred) or by subscription display name.
+        $resolvedHubId = $null
+        $hubLookup = $HubSubscription.Trim().ToLowerInvariant()
+
+        $requestedByLower = @{}
+        foreach ($rid in $requestedSubscriptionIds) {
+            $requestedByLower[$rid.ToLowerInvariant()] = $rid
+        }
+
+        if ($requestedByLower.ContainsKey($hubLookup)) {
+            $resolvedHubId = $requestedByLower[$hubLookup]
+        } else {
+            foreach ($entry in $subscriptionNames.GetEnumerator()) {
+                if ($entry.Value -eq $HubSubscription.Trim()) {
+                    $resolvedHubId = $entry.Key
+                    break
+                }
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($resolvedHubId)) {
+            Write-Warning "Hub subscription '$HubSubscription' was not found in the requested subscriptions. Falling back to count-based complex filtering."
+            $summaryEdgeRecords = @($summaryEdgeRecords | Where-Object { $_.Count -ge $MinCrossPeeringsForComplex })
+        } else {
+            # Build partner map using all cross-subscription relationships.
+            $partnersBySubscription = @{}
+            foreach ($pair in $summaryEdgeMap.Values) {
+                if (-not $partnersBySubscription.ContainsKey($pair.FromKey)) {
+                    $partnersBySubscription[$pair.FromKey] = [System.Collections.Generic.HashSet[string]]::new()
+                }
+                if (-not $partnersBySubscription.ContainsKey($pair.ToKey)) {
+                    $partnersBySubscription[$pair.ToKey] = [System.Collections.Generic.HashSet[string]]::new()
+                }
+                $null = $partnersBySubscription[$pair.FromKey].Add($pair.ToKey)
+                $null = $partnersBySubscription[$pair.ToKey].Add($pair.FromKey)
+            }
+
+            # Non-complex subscriptions are those connected to hub and to no one else.
+            $hubOnlySpokes = [System.Collections.Generic.HashSet[string]]::new()
+            foreach ($subId in $partnersBySubscription.Keys) {
+                if ($subId -eq $resolvedHubId) {
+                    continue
+                }
+
+                $partners = @($partnersBySubscription[$subId])
+                if ($partners.Count -gt 0) {
+                    $nonHubPartners = @($partners | Where-Object { $_ -ne $resolvedHubId })
+                    if ($nonHubPartners.Count -eq 0) {
+                        $null = $hubOnlySpokes.Add($subId)
+                    }
+                }
+            }
+
+            # Keep all edges that do not involve hub-only spokes.
+            $summaryEdgeRecords = @(
+                $summaryEdgeRecords |
+                    Where-Object {
+                        -not $hubOnlySpokes.Contains($_.FromKey) -and -not $hubOnlySpokes.Contains($_.ToKey)
+                    }
+            )
+        }
+    } else {
+        $summaryEdgeRecords = @($summaryEdgeRecords | Where-Object { $_.Count -ge $MinCrossPeeringsForComplex })
+    }
 }
 
 $summaryNodeIdsInUse = @{}
