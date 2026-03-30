@@ -31,6 +31,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# Parse subscription/resource-group/vnet values from a VNet resource ID.
 function Get-VnetPartsFromResourceId {
     param(
         [Parameter(Mandatory = $true)]
@@ -51,6 +52,7 @@ function Get-VnetPartsFromResourceId {
     }
 }
 
+# Sanitize graph identifiers for DOT node IDs.
 function Get-SafeNodeId {
     param(
         [Parameter(Mandatory = $true)]
@@ -65,6 +67,7 @@ function Get-SafeNodeId {
     return $safe
 }
 
+# Sanitize file names for Windows and cross-platform safety.
 function Get-SafeFileName {
     param(
         [Parameter(Mandatory = $true)]
@@ -74,6 +77,7 @@ function Get-SafeFileName {
     return ($Text -replace '[<>:"/\\|?*]', '_')
 }
 
+# Escape labels for Mermaid and DOT outputs.
 function Escape-MermaidLabel {
     param(
         [Parameter(Mandatory = $true)]
@@ -92,6 +96,7 @@ function Escape-DotLabel {
     return ($Text -replace '"', '\"')
 }
 
+# Build Mermaid graph content from normalized node/edge model.
 function Build-Mermaid {
     param(
         [Parameter(Mandatory = $true)]
@@ -118,6 +123,7 @@ function Build-Mermaid {
     return $lines -join [Environment]::NewLine
 }
 
+# Build Graphviz DOT graph content from normalized node/edge model.
 function Build-Graphviz {
     param(
         [Parameter(Mandatory = $true)]
@@ -151,6 +157,7 @@ function Build-Graphviz {
     return $lines -join [Environment]::NewLine
 }
 
+# Re-index nodes to short sequential IDs so output files stay compact.
 function Convert-ToDiagramModel {
     param(
         [Parameter(Mandatory = $true)]
@@ -193,6 +200,7 @@ function Convert-ToDiagramModel {
     }
 }
 
+# Persist one diagram in Mermaid and/or Graphviz based on selected format.
 function Write-DiagramFiles {
     param(
         [Parameter(Mandatory = $true)]
@@ -248,6 +256,7 @@ if (-not (Test-Path -Path $OutputPath)) {
     New-Item -ItemType Directory -Path $OutputPath | Out-Null
 }
 
+# Authenticate once before scanning multiple subscriptions.
 $null = Connect-AzAccount -ErrorAction Stop
 
 $allNodes = @{}
@@ -258,6 +267,7 @@ $allEdges = [System.Collections.Generic.List[object]]::new()
 $subscriptionNames = @{}
 $requestedSubscriptionIds = [System.Collections.Generic.List[string]]::new()
 
+# Normalize user input into a unique ID list and optional ID->name lookup.
 foreach ($sub in $Subscriptions) {
     if ($sub -is [string]) {
         $id = $sub.Trim()
@@ -282,6 +292,7 @@ foreach ($sub in $Subscriptions) {
 
 $requestedSubscriptionIds = @($requestedSubscriptionIds | Sort-Object -Unique)
 
+# Collect VNets and peerings from each subscription context.
 foreach ($subscriptionId in $requestedSubscriptionIds) {
     $context = Set-AzContext -SubscriptionId $subscriptionId -ErrorAction Stop
     # Only fill name from context if not already provided by a subscription object
@@ -352,6 +363,7 @@ New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
 
 $manifestRows = [System.Collections.Generic.List[object]]::new()
 
+# Create one intra-subscription diagram per requested subscription.
 foreach ($subscriptionId in $requestedSubscriptionIds) {
     $subscriptionNodes = @($allNodes.Values | Where-Object { $_.SubscriptionId -eq $subscriptionId })
     $subscriptionEdges = @($allEdges | Where-Object { $_.FromSubscriptionId -eq $subscriptionId -and $_.ToSubscriptionId -eq $subscriptionId })
@@ -373,6 +385,7 @@ foreach ($subscriptionId in $requestedSubscriptionIds) {
 }
 
 $summaryEdgeMap = @{}
+# Aggregate all inter-subscription peerings into subscription-pair edges.
 foreach ($edge in $allEdges | Where-Object { $_.FromSubscriptionId -ne $_.ToSubscriptionId }) {
     $pair = @($edge.FromSubscriptionId, $edge.ToSubscriptionId) | Sort-Object
     $pairKey = $pair[0] + '|' + $pair[1]
@@ -391,10 +404,13 @@ foreach ($edge in $allEdges | Where-Object { $_.FromSubscriptionId -ne $_.ToSubs
 }
 
 $summaryEdgeRecords = @($summaryEdgeMap.Values)
+$resolvedHubId = $null
+$hubOnlySpokes = [System.Collections.Generic.HashSet[string]]::new()
+
+# Optional filtering for complex-only cross-subscription relationships.
 if ($ComplexCrossConnectionsOnly) {
     if (-not [string]::IsNullOrWhiteSpace($HubSubscription)) {
         # Resolve hub by ID (preferred) or by subscription display name.
-        $resolvedHubId = $null
         $hubLookup = $HubSubscription.Trim().ToLowerInvariant()
 
         $requestedByLower = @{}
@@ -431,7 +447,6 @@ if ($ComplexCrossConnectionsOnly) {
             }
 
             # Non-complex subscriptions are those connected to hub and to no one else.
-            $hubOnlySpokes = [System.Collections.Generic.HashSet[string]]::new()
             foreach ($subId in $partnersBySubscription.Keys) {
                 if ($subId -eq $resolvedHubId) {
                     continue
@@ -492,6 +507,52 @@ $manifestRows.Add([pscustomobject]@{
     OutputFiles    = ($summaryWrittenFiles -join ';')
 })
 
+if ($ComplexCrossConnectionsOnly -and -not [string]::IsNullOrWhiteSpace($HubSubscription) -and -not [string]::IsNullOrWhiteSpace($resolvedHubId) -and $hubOnlySpokes.Count -gt 0) {
+    # Inverse view: hub-only spokes (subscriptions with no non-hub cross connections).
+    $nonComplexEdgeRecords = @(
+        $summaryEdgeMap.Values |
+            Where-Object {
+                ($_.FromKey -eq $resolvedHubId -and $hubOnlySpokes.Contains($_.ToKey)) -or
+                ($_.ToKey -eq $resolvedHubId -and $hubOnlySpokes.Contains($_.FromKey))
+            }
+    )
+
+    $nonComplexNodeIdsInUse = @{}
+    foreach ($edge in $nonComplexEdgeRecords) {
+        $nonComplexNodeIdsInUse[$edge.FromKey] = $true
+        $nonComplexNodeIdsInUse[$edge.ToKey] = $true
+    }
+
+    $nonComplexNodeRecords = @(
+        $allNodes.Values |
+            Group-Object -Property SubscriptionId |
+            Sort-Object -Property Name |
+            Where-Object { $nonComplexNodeIdsInUse.ContainsKey($_.Name) } |
+            ForEach-Object {
+                $subId = $_.Name
+                $subLabel = if ($subscriptionNames.ContainsKey($subId.ToLowerInvariant())) { $subscriptionNames[$subId.ToLowerInvariant()] } else { $subId }
+                [pscustomobject]@{
+                    Key          = $subId
+                    DisplayLabel = $subLabel
+                }
+            }
+    )
+
+    $nonComplexDiagramModel = Convert-ToDiagramModel -NodeRecords $nonComplexNodeRecords -EdgeRecords $nonComplexEdgeRecords
+    $nonComplexBaseFileName = $GraphName + "-cross-subscriptions-hub-only"
+    $nonComplexGraphTitle = $GraphName + " cross subscriptions hub-only"
+    $nonComplexWrittenFiles = Write-DiagramFiles -Nodes $nonComplexDiagramModel.Nodes -Edges $nonComplexDiagramModel.Edges -Format $Format -OutputDirectory $outputDirectory -BaseFileName $nonComplexBaseFileName -GraphTitle $nonComplexGraphTitle
+
+    $manifestRows.Add([pscustomobject]@{
+        DiagramType    = "cross-subscription-hub-only"
+        Scope          = "hub-only"
+        NodeCount      = $nonComplexDiagramModel.Nodes.Count
+        EdgeCount      = $nonComplexDiagramModel.Edges.Count
+        OutputFiles    = ($nonComplexWrittenFiles -join ';')
+    })
+}
+
+# Export a manifest with diagram metadata and output file paths.
 $manifestPath = Join-Path $outputDirectory "manifest.csv"
 $manifestRows | Export-Csv -Path $manifestPath -NoTypeInformation -Encoding UTF8
 
