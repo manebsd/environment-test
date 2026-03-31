@@ -1,0 +1,67 @@
+name: Render Mermaid Diagrams
+
+on:
+  push:
+    branches:
+      - main
+      - initial-test
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Configure Mermaid CLI Puppeteer options
+        run: |
+          cat > puppeteer-config.json << 'EOF'
+          {
+            "args": [
+              "--no-sandbox",
+              "--disable-setuid-sandbox"
+            ]
+          }
+          EOF
+
+      - name: Render .mmd files to .png
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -d '' files < <(find . -type f -name '*.mmd' -print0)
+
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No .mmd files found. Nothing to render."
+            exit 0
+          fi
+
+          for mmd_file in "${files[@]}"; do
+            png_file="${mmd_file%.mmd}.png"
+            echo "Rendering ${mmd_file} -> ${png_file}"
+
+            npx --yes @mermaid-js/mermaid-cli \
+              --input "${mmd_file}" \
+              --output "${png_file}" \
+              --outputFormat png \
+              --puppeteerConfigFile puppeteer-config.json
+          done
+
+      - name: Upload generated PNG files
+        uses: actions/upload-artifact@v4
+        with:
+          name: mermaid-png
+          path: |
+            **/*.png
+          if-no-files-found: warn
